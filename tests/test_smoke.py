@@ -43,13 +43,21 @@ def test_py_compile():
 
 
 def test_profiles_valid_json():
+    # profile.json is gitignored, so fresh clones (CI) only have the example.
+    checked = []
     for name in ("profile.json", "profile.example.json"):
-        with open(os.path.join(BASE_DIR, name)) as f:
+        path = os.path.join(BASE_DIR, name)
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
             data = json.load(f)
         assert isinstance(data, dict), name
         assert data["name"]["first"], name
         assert "@" in data["email"], name
-    print("PASS profiles are valid JSON with expected keys")
+        checked.append(name)
+    assert "profile.example.json" in checked, "example profile missing"
+    print("PASS profiles are valid JSON with expected keys (%s)"
+          % ", ".join(checked))
 
 
 def test_parse_steps():
