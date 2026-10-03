@@ -6,6 +6,31 @@ page, and uses your own LLM to decide what to click and what to type,
 field by field. Your profile data is preloaded from `profile.json` and your
 standing rules from `rules.md`.
 
+## Try it on GitHub
+
+**Option A: Codespaces (web UI, fastest).**
+On the repo page: Code > Codespaces > Create codespace on main. Wait for
+the container to build (it installs Python deps and Chromium, then starts
+the web app automatically). Open the forwarded port **5000** ("Job Agent
+Web UI") when it pops up, or find it under the Ports tab. Paste a job
+posting URL, check the prefilled John Doe test profile, hit Start, and
+watch the live log and screenshots.
+
+**Option B: Actions (headless run, no UI).**
+Repo page > Actions > "Run job-apply agent" > Run workflow. Enter the job
+posting URL and max steps. When it finishes, download the `agent-run`
+artifact: it holds `runs/<id>/log.jsonl` and every step screenshot.
+
+**Option C: local web app.**
+
+```bash
+python webapp/app.py   # http://localhost:5000 (PORT env to change)
+```
+
+All three use the John Doe test profile. The web UI and the Actions run
+never submit: the agent always stops before the final Submit/Apply button
+and returns a filled-fields summary.
+
 ## Setup
 
 ```bash
@@ -100,6 +125,9 @@ python run.py --url https://example.com/jobs/123 --max-steps 80
 - Unknown fields are left blank and logged, never invented.
 - One application per company and the other rules in `rules.md` are part
   of the model's instructions.
+- Web UI / Actions runs never submit, period: there is no `--auto-submit`
+  in `webapp/app.py`, and password fields become `need_human` instead of
+  prompting (a server cannot ask you for a password).
 
 ## Limitations (v1)
 

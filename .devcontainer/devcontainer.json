@@ -1,0 +1,1 @@
+{"forwardPorts":[5000],"image":"mcr.microsoft.com/devcontainers/python:3.12","name":"Job Apply Agent","portsAttributes":{"5000":{"label":"Job Agent Web UI","onAutoForward":"openPreview"}},"postCreateCommand":"pip install -r requirements.txt && python -m playwright install --with-deps chromium","postStartCommand":"nohup python webapp/app.py > /tmp/webapp.log 2>&1 &"}
