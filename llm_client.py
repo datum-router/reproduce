@@ -30,14 +30,21 @@ API_KEY = os.environ.get("LLM_API_KEY", "")
 
 # Retry policy for transient upstream failures (e.g. Pollinations' server
 # occasionally 500s with "ENOSPC: no space left on device", or 402s during
-# degradation). Up to MAX_ATTEMPTS tries; waits RETRY_DELAYS[i] between
-# attempt i and i+1.
+# degradation - observed transient on their anonymous tier). Up to
+# MAX_ATTEMPTS tries per model; waits RETRY_DELAYS[i] between attempt i
+# and i+1. When the primary model is exhausted on Pollinations, one full
+# retry sequence runs against POLLINATIONS_FALLBACK_MODEL before giving up.
 MAX_ATTEMPTS = 3
 RETRY_DELAYS = (2, 5, 12)
+POLLINATIONS_FALLBACK_MODEL = "openai-fast"
 
 
 class LLMError(Exception):
     """Raised when the model call fails, with a plain-English message."""
+
+    def __init__(self, message, retriable=False):
+        super().__init__(message)
+        self.retriable = retriable
 
 
 class LLMClient:
@@ -53,51 +60,89 @@ class LLMClient:
         self.model = model or MODEL
         self.api_key = API_KEY if api_key is None else api_key
 
-    def chat(self, messages, temperature=0.0, timeout=120):
-        """Send chat-completion messages, return the assistant's text.
+    def _is_pollinations(self):
+        return "pollinations.ai" in self.base_url
 
-        Retries on HTTP 5xx and connection errors with exponential backoff.
-        Fails fast (no retry) on 4xx and on malformed model responses.
-        Raises LLMError when all attempts are exhausted.
-        """
+    def _retriable_status(self, status):
+        if 500 <= status < 600:
+            return True
+        # Pollinations' anonymous tier intermittently 402s while degraded;
+        # observed transient there, so retry it - but nowhere else, where a
+        # 402 genuinely means payment required.
+        return status == 402 and self._is_pollinations()
+
+    def _post_once(self, model, messages, temperature, timeout):
+        """One attempt. Returns (ok, result, retriable)."""
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = "Bearer " + self.api_key
-
-        body = {"model": self.model, "messages": messages,
+        body = {"model": model, "messages": messages,
                 "temperature": temperature}
-
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            resp = requests.post(
+                self.base_url + "/chat/completions", headers=headers,
+                data=json.dumps(body), timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            return False, "network error calling %s: %s" % (self.base_url,
+                                                            exc), True
+        if resp.status_code == 200:
             try:
-                resp = requests.post(
-                    self.base_url + "/chat/completions", headers=headers,
-                    data=json.dumps(body), timeout=timeout,
-                )
-            except requests.RequestException as exc:
-                failure = "network error calling %s: %s" % (self.base_url,
-                                                            exc)
-                retriable = True
-            else:
-                if resp.status_code == 200:
-                    try:
-                        return resp.json()["choices"][0]["message"]["content"]
-                    except (ValueError, KeyError, IndexError,
-                            TypeError) as exc:
-                        raise LLMError("unexpected model response: %s" % exc)
-                failure = "model returned HTTP %s: %s" % (
-                    resp.status_code, resp.text[:300])
-                retriable = 500 <= resp.status_code < 600
+                return True, resp.json()["choices"][0]["message"]["content"], \
+                    False
+            except (ValueError, KeyError, IndexError,
+                    TypeError) as exc:
+                raise LLMError("unexpected model response: %s" % exc)
+        failure = "model returned HTTP %s: %s" % (
+            resp.status_code, resp.text[:300])
+        return False, failure, self._retriable_status(resp.status_code)
 
+    def _run_with_retries(self, model, messages, temperature, timeout):
+        last_failure = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            ok, result, retriable = self._post_once(model, messages,
+                                                   temperature, timeout)
+            if ok:
+                return result
+            last_failure = result
             if not retriable:
-                raise LLMError(failure)  # 4xx: fail fast, retrying won't help
+                raise LLMError(result, retriable=False)
             if attempt < MAX_ATTEMPTS:
                 delay = RETRY_DELAYS[attempt - 1]
                 print("LLM attempt %d/%d failed (%s); retrying in %ds"
-                      % (attempt, MAX_ATTEMPTS, failure, delay), flush=True)
+                      % (attempt, MAX_ATTEMPTS, result, delay), flush=True)
                 time.sleep(delay)
-            else:
-                raise LLMError("model call failed after %d attempts: %s"
-                               % (MAX_ATTEMPTS, failure))
+        raise LLMError("model call failed after %d attempts: %s"
+                       % (MAX_ATTEMPTS, last_failure), retriable=True)
+
+    def chat(self, messages, temperature=0.0, timeout=120):
+        """Send chat-completion messages, return the assistant's text.
+
+        Retries on HTTP 5xx, connection errors, and Pollinations' transient
+        402s, with backoff. Fails fast (no retry) on other 4xx and on
+        malformed model responses. On Pollinations, when the configured
+        model is exhausted by transient failures, one full retry sequence
+        runs against the fallback model before giving up.
+        Raises LLMError when all attempts are exhausted.
+        """
+        try:
+            return self._run_with_retries(self.model, messages, temperature,
+                                          timeout)
+        except LLMError as exc:
+            if (exc.retriable and self._is_pollinations()
+                    and self.model != POLLINATIONS_FALLBACK_MODEL):
+                print("Primary model %r exhausted; falling back to %r"
+                      % (self.model, POLLINATIONS_FALLBACK_MODEL), flush=True)
+                try:
+                    return self._run_with_retries(
+                        POLLINATIONS_FALLBACK_MODEL, messages, temperature,
+                        timeout)
+                except LLMError as exc2:
+                    raise LLMError(
+                        "Pollinations is degraded right now (tried %r then "
+                        "%r). Wait a minute and retry the run. Last error: %s"
+                        % (self.model, POLLINATIONS_FALLBACK_MODEL, exc2))
+            raise
 
 
 _default_client = LLMClient()

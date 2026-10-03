@@ -424,6 +424,128 @@ def test_flask_routes():
     print("PASS flask routes (index, validation, 404s) - no browser launched")
 
 
+def test_llm_402_retried_on_pollinations():
+    """Pollinations' transient 402s (seen during degradation) are retried."""
+    import llm_client
+    from unittest.mock import patch
+
+    calls = []
+
+    class R402:
+        status_code = 402
+        text = '{}'
+
+    class R200:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"choices": [{"message": {"content": "recovered"}}]}
+
+    def fake_post(*a, **k):
+        calls.append(1)
+        return R402() if len(calls) < 3 else R200()
+
+    with patch.object(llm_client.requests, "post", side_effect=fake_post), \
+         patch.object(llm_client.time, "sleep", return_value=None):
+        text = llm_client.chat([{"role": "user", "content": "hi"}])
+    assert text == "recovered", text
+    assert len(calls) == 3, calls
+    print("PASS llm 402 on Pollinations retried, then success")
+
+
+def test_llm_402_not_retried_elsewhere():
+    """A 402 from a non-Pollinations provider means payment: fail fast,
+    no fallback."""
+    import llm_client
+    from unittest.mock import patch
+
+    calls = []
+
+    class R402:
+        status_code = 402
+        text = '{"error":"payment required"}'
+
+    def fake_post(*a, **k):
+        calls.append(1)
+        return R402()
+
+    client = llm_client.LLMClient(base_url="https://example.com/v1",
+                                  model="x")
+    with patch.object(llm_client.requests, "post", side_effect=fake_post), \
+         patch.object(llm_client.time, "sleep", return_value=None):
+        try:
+            client.chat([{"role": "user", "content": "hi"}])
+        except llm_client.LLMError as exc:
+            assert "402" in str(exc), exc
+        else:
+            raise AssertionError("expected LLMError on 402")
+    assert len(calls) == 1, calls
+    print("PASS llm 402 elsewhere fails fast (1 attempt, no fallback)")
+
+
+def test_llm_pollinations_fallback_model():
+    """Primary model exhausted by 500s -> full retry sequence on
+    openai-fast, which succeeds."""
+    import json as json_mod
+    import llm_client
+    from unittest.mock import patch
+
+    models_seen = []
+
+    class R500:
+        status_code = 500
+        text = '{"error":"ENOSPC: no space left on device, write"}'
+
+    class R200:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"choices": [{"message": {"content": "via-fallback"}}]}
+
+    def fake_post(url, headers=None, data=None, timeout=None):
+        models_seen.append(json_mod.loads(data)["model"])
+        return R500() if models_seen[-1] == "openai" else R200()
+
+    with patch.object(llm_client.requests, "post", side_effect=fake_post), \
+         patch.object(llm_client.time, "sleep", return_value=None):
+        text = llm_client.chat([{"role": "user", "content": "hi"}])
+    assert text == "via-fallback", text
+    assert models_seen == ["openai"] * 3 + ["openai-fast"], models_seen
+    print("PASS llm falls back to openai-fast after primary exhausted")
+
+
+def test_llm_no_fallback_when_already_fallback():
+    """Already on openai-fast and failing -> 3 attempts, then give up,
+    no second fallback loop."""
+    import llm_client
+    from unittest.mock import patch
+
+    calls = []
+
+    class R500:
+        status_code = 500
+        text = '{"error":"ENOSPC"}'
+
+    def fake_post(*a, **k):
+        calls.append(1)
+        return R500()
+
+    client = llm_client.LLMClient(model="openai-fast")
+    with patch.object(llm_client.requests, "post", side_effect=fake_post), \
+         patch.object(llm_client.time, "sleep", return_value=None):
+        try:
+            client.chat([{"role": "user", "content": "hi"}])
+        except llm_client.LLMError as exc:
+            assert "after 3 attempts" in str(exc), exc
+            assert "falling back" not in str(exc), exc
+        else:
+            raise AssertionError("expected LLMError")
+    assert len(calls) == 3, calls
+    print("PASS llm on fallback model fails after 3 attempts, no loop")
+
+
 def main():
     test_py_compile()
     test_profiles_valid_json()
@@ -434,6 +556,10 @@ def main():
     test_llm_retry_then_success()
     test_llm_400_fails_fast()
     test_llm_connection_error_retries()
+    test_llm_402_retried_on_pollinations()
+    test_llm_402_not_retried_elsewhere()
+    test_llm_pollinations_fallback_model()
+    test_llm_no_fallback_when_already_fallback()
     test_control_endpoints()
     test_llm_client_explicit_args()
     test_api_runs_llm_overrides()
