@@ -1,0 +1,11 @@
+# Local-only files: never commit these.
+profile.json
+browser-profile/
+runs/
+shots/
+.env
+# Python bytecode
+__pycache__/
+*.pyc
+# Local dev environment
+.venv/
