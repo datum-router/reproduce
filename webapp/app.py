@@ -18,6 +18,7 @@ Run locally:
 """
 
 import datetime
+import html
 import json
 import os
 import re
@@ -263,9 +264,11 @@ def _run_in_thread(run_id, url, profile, rules_text, max_steps):
 
 @app.route("/")
 def index():
-    return INDEX_HTML.replace("__PROFILE_JSON__",
-                              DEFAULT_PROFILE_TEXT.replace("\\", "\\\\")
-                              .replace("`", "\\`").replace("$", "\\$"))
+    # The textarea holds plain HTML text, not a JS string literal, so only
+    # HTML-escape it. Escaping $, backticks or backslashes here corrupts the
+    # JSON (e.g. $80k became \$80k, which JSON.parse rejects in the browser).
+    safe = html.escape(DEFAULT_PROFILE_TEXT)
+    return INDEX_HTML.replace("__PROFILE_JSON__", safe)
 
 
 @app.route("/api/runs", methods=["POST"])

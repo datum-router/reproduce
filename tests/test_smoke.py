@@ -118,6 +118,26 @@ def test_submit_detection():
     print("PASS submit-button detection (blocks final, allows Next)")
 
 
+def test_index_profile_is_valid_json():
+    """Regression: the profile prefilled into the index page textarea must
+    still parse as JSON after HTML escaping. A past bug escaped $ as \\$,
+    which made the browser's JSON.parse reject the profile."""
+    import html as htmlmod
+    import re
+    from app import app
+    client = app.test_client()
+    r = client.get("/")
+    assert r.status_code == 200, r.status_code
+    m = re.search(rb'<textarea id="profile" rows="12">(.*?)</textarea>',
+                  r.data, re.S)
+    assert m, "profile textarea missing from index page"
+    profile = json.loads(htmlmod.unescape(m.group(1).decode()))
+    assert isinstance(profile, dict), type(profile)
+    assert profile["name"]["first"], profile.get("name")
+    assert "$80k" in json.dumps(profile), "dollar amounts must survive"
+    print("PASS index page profile textarea parses as JSON")
+
+
 def test_flask_routes():
     from app import app
     client = app.test_client()
@@ -145,6 +165,7 @@ def main():
     test_parse_steps()
     test_snapshot_js()
     test_submit_detection()
+    test_index_profile_is_valid_json()
     test_flask_routes()
     print("\nAll smoke tests passed.")
 
