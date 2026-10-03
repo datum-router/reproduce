@@ -66,6 +66,16 @@ automatically: up to 3 attempts with 2s / 5s / 12s backoff, so one bad
 Pollinations response doesn't kill a run. 4xx errors fail fast with no
 retry.
 
+### When Pollinations is down
+
+Pollinations' free tier can stay degraded for a while (HTTP 500/402 from
+their side). For a backup, get a free Gemini key at Google AI Studio
+(aistudio.google.com, sign in, Create API key, no card needed, generous
+free tier). In the web UI run form, fill the LLM override fields: base URL
+`https://generativelanguage.googleapis.com/v1beta/openai`, model
+`gemini-2.0-flash`, and paste your key. The key lives in memory for that
+run only and is never saved or logged.
+
 ## Profile setup
 
 `profile.json` holds your personal data and is **gitignored**, so it never

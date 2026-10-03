@@ -310,6 +310,99 @@ def test_control_endpoints():
           "400/404/409)")
 
 
+def test_llm_client_explicit_args():
+    import llm_client
+    from unittest.mock import patch
+
+    # Explicit args win over env defaults.
+    c = llm_client.LLMClient(base_url="https://example-llm.test/v1/",
+                             model="test-model", api_key="sk-test-123")
+    assert c.base_url == "https://example-llm.test/v1", c.base_url
+    assert c.model == "test-model", c.model
+    assert c.api_key == "sk-test-123", c.api_key
+
+    # None falls back to env defaults.
+    d = llm_client.LLMClient()
+    assert d.base_url == llm_client.BASE_URL, d.base_url
+    assert d.model == llm_client.MODEL, d.model
+    assert d.api_key == llm_client.API_KEY, d.api_key
+
+    # The override actually drives the HTTP call (url, header, body model).
+    seen = {}
+
+    class R200:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    def fake_post(url, headers=None, data=None, timeout=None):
+        seen["url"] = url
+        seen["headers"] = headers
+        seen["body"] = json.loads(data)
+        return R200()
+
+    with patch.object(llm_client.requests, "post", side_effect=fake_post):
+        text = c.chat([{"role": "user", "content": "hi"}])
+    assert text == "ok", text
+    assert seen["url"] == "https://example-llm.test/v1/chat/completions", \
+        seen["url"]
+    assert seen["headers"].get("Authorization") == "Bearer sk-test-123", \
+        seen["headers"]
+    assert seen["body"]["model"] == "test-model", seen["body"]
+    print("PASS llm client honors explicit args over env (url/header/model)")
+
+
+def test_api_runs_llm_overrides():
+    import app as app_mod
+    from unittest.mock import patch
+
+    captured = {}
+
+    def fake_run_in_thread(run_id, url, profile, rules_text, max_steps,
+                           control_queue, paused, llm_client=None):
+        captured["run_id"] = run_id
+        captured["llm_client"] = llm_client
+
+    client = app_mod.app.test_client()
+    with patch.object(app_mod, "_run_in_thread",
+                      side_effect=fake_run_in_thread):
+        # With overrides: client built, key held, never leaked.
+        r = client.post("/api/runs", json={
+            "url": "https://example.com/jobs/1",
+            "profile": {"name": {"first": "John"}},
+            "llm_base_url": "https://example-llm.test/v1",
+            "llm_model": "test-model",
+            "llm_api_key": "sk-secret-xyz",
+        })
+        assert r.status_code == 200, r.status_code
+        run_id = r.get_json()["run_id"]
+        lc = captured["llm_client"]
+        assert lc is not None, "expected an LLMClient with overrides"
+        assert lc.base_url == "https://example-llm.test/v1", lc.base_url
+        assert lc.model == "test-model", lc.model
+        assert lc.api_key == "sk-secret-xyz", lc.api_key
+
+        # The status endpoint must never leak the key.
+        s = client.get("/api/runs/%s/status" % run_id).get_json()
+        blob = json.dumps(s)
+        assert "sk-secret-xyz" not in blob, blob
+        assert "llm_api_key" not in blob, blob
+        # The redacted override note may mention base_url/model, not the key.
+        assert not any("sk-secret-xyz" in line for line in s["log_tail"])
+
+        # Without overrides: no client, server defaults in effect.
+        captured.clear()
+        r = client.post("/api/runs", json={
+            "url": "https://example.com/jobs/2",
+            "profile": {"name": {"first": "John"}},
+        })
+        assert r.status_code == 200, r.status_code
+        assert captured["llm_client"] is None, captured["llm_client"]
+    print("PASS /api/runs accepts llm overrides, status never leaks the key")
+
+
 def test_flask_routes():
     from app import app
     client = app.test_client()
@@ -342,6 +435,8 @@ def main():
     test_llm_400_fails_fast()
     test_llm_connection_error_retries()
     test_control_endpoints()
+    test_llm_client_explicit_args()
+    test_api_runs_llm_overrides()
     test_flask_routes()
     print("\nAll smoke tests passed.")
 

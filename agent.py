@@ -149,13 +149,16 @@ ALLOWED_ACTIONS = {
 
 class Agent:
     def __init__(self, url, profile, rules, headed=False,
-                 auto_submit=False, max_steps=40):
+                 auto_submit=False, max_steps=40, llm_client=None):
         self.url = url
         self.profile = profile
         self.rules = rules
         self.headed = headed
         self.auto_submit = auto_submit
         self.max_steps = max_steps
+        # Optional LLMClient with per-run overrides (base_url/model/api_key).
+        # None means "use the module-level env-configured chat()".
+        self.llm_client = llm_client
 
         self.run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_dir = os.path.join(RUNS_DIR, self.run_id)
@@ -306,7 +309,8 @@ class Agent:
         ]
         for attempt in (1, 2):
             try:
-                reply = chat(messages)
+                chat_fn = (self.llm_client.chat if self.llm_client else chat)
+                reply = chat_fn(messages)
             except LLMError as exc:
                 self.log("llm_error", error=str(exc))
                 return None

@@ -35,6 +35,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE_DIR)
 
 from agent import Agent, RUNS_DIR  # noqa: E402
+from llm_client import LLMClient  # noqa: E402
 
 app = Flask(__name__)
 
@@ -94,9 +95,10 @@ class WebAgent(Agent):
     """
 
     def __init__(self, run_id, url, profile, rules, max_steps, callbacks,
-                 control_queue, paused):
+                 control_queue, paused, llm_client=None):
         super().__init__(url, profile, rules, headed=False,
-                         auto_submit=False, max_steps=max_steps)
+                         auto_submit=False, max_steps=max_steps,
+                         llm_client=llm_client)
         self.run_id = run_id
         self.control_queue = control_queue  # user ops, agent thread executes
         self.paused = paused                # threading.Event: human has control
@@ -259,11 +261,12 @@ class WebAgent(Agent):
 
 
 def run_application(run_id, url, profile, rules, max_steps, callbacks,
-                    control_queue, paused):
+                    control_queue, paused, llm_client=None):
     """Entry point used by the web UI: build a WebAgent and run it."""
     agent = WebAgent(run_id, url, profile, rules,
                      max_steps=max_steps, callbacks=callbacks,
-                     control_queue=control_queue, paused=paused)
+                     control_queue=control_queue, paused=paused,
+                     llm_client=llm_client)
     agent.run()
     return run_id
 
@@ -306,10 +309,11 @@ def make_callbacks(run_id):
 
 
 def _run_in_thread(run_id, url, profile, rules_text, max_steps,
-                   control_queue, paused):
+                   control_queue, paused, llm_client=None):
     try:
         run_application(run_id, url, profile, rules_text, max_steps,
-                        make_callbacks(run_id), control_queue, paused)
+                        make_callbacks(run_id), control_queue, paused,
+                        llm_client=llm_client)
     except Exception as exc:  # noqa: BLE001 - never leave a run hanging
         rec = _record(run_id)
         if rec is not None:
@@ -349,6 +353,18 @@ def api_start_run():
         return jsonify({"error": "max_steps must be a number"}), 400
     max_steps = max(1, min(100, max_steps))
 
+    # Optional per-run LLM override (for when the default Pollinations
+    # endpoint is degraded). Empty means "use server defaults". The API key
+    # is held in memory for this run only: it is never stored in the run
+    # record, never logged, and never returned by the status endpoint.
+    llm_base_url = (data.get("llm_base_url") or "").strip() or None
+    llm_model = (data.get("llm_model") or "").strip() or None
+    llm_api_key = (data.get("llm_api_key") or "").strip() or None
+    llm_client = None
+    if llm_base_url or llm_model or llm_api_key:
+        llm_client = LLMClient(base_url=llm_base_url, model=llm_model,
+                               api_key=llm_api_key)
+
     run_id = uuid.uuid4().hex[:12]
     control_queue = queue.Queue()
     paused = threading.Event()
@@ -367,9 +383,15 @@ def api_start_run():
             "control_queue": control_queue,
             "paused_event": paused,
         }
+        if llm_client is not None:
+            # Redacted: base_url and model only, never the key.
+            runs[run_id]["log"].append(
+                "[%s] llm override: base_url=%s model=%s (api key %s)"
+                % (_now(), llm_client.base_url, llm_client.model,
+                   "supplied" if llm_api_key else "not supplied"))
     t = threading.Thread(target=_run_in_thread,
                          args=(run_id, url, profile, RULES_TEXT, max_steps,
-                               control_queue, paused),
+                               control_queue, paused, llm_client),
                          daemon=True)
     with runs_lock:
         runs[run_id]["state"] = "running"
@@ -539,6 +561,11 @@ before the final Submit button. Watch the log and screenshots below.</p>
   <input type="number" id="maxsteps" value="25" min="1" max="100" style="width:120px">
   <label for="profile">Profile JSON (test data prefilled)</label>
   <textarea id="profile" rows="12">__PROFILE_JSON__</textarea>
+  <label>LLM override (optional, for when Pollinations is down)</label>
+  <input type="text" id="llmBaseUrl" placeholder="Base URL, e.g. https://generativelanguage.googleapis.com/v1beta/openai (blank = default)">
+  <input type="text" id="llmModel" placeholder="Model, e.g. gemini-2.0-flash (blank = default)" style="margin-top:6px">
+  <input type="password" id="llmApiKey" placeholder="API key (blank = default)" style="margin-top:6px" autocomplete="off">
+  <p class="note">A key entered here stays in memory for this run only. It is never saved, never logged, and never appears in the status output.</p>
   <p><button id="start" onclick="startRun()">Start run</button></p>
 </div>
 
@@ -639,6 +666,9 @@ async function startRun() {
   const url = document.getElementById('url').value.trim();
   const profile = document.getElementById('profile').value;
   const max_steps = parseInt(document.getElementById('maxsteps').value, 10) || 25;
+  const llm_base_url = document.getElementById('llmBaseUrl').value.trim();
+  const llm_model = document.getElementById('llmModel').value.trim();
+  const llm_api_key = document.getElementById('llmApiKey').value;
   if (!url) { alert('Enter a job posting URL first.'); return; }
   try { JSON.parse(profile); } catch (e) { alert('Profile is not valid JSON.'); return; }
   const btn = document.getElementById('start');
@@ -649,8 +679,11 @@ async function startRun() {
   logSeen = 0; shotsSeen = 0;
   const r = await fetch('/api/runs', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({url, profile, max_steps})
+    body: JSON.stringify({url, profile, max_steps,
+                          llm_base_url, llm_model, llm_api_key})
   });
+  // Don't leave the key sitting in the form.
+  document.getElementById('llmApiKey').value = '';
   const data = await r.json();
   if (!r.ok) { alert(data.error || 'Failed to start'); btn.disabled = false; btn.textContent = 'Start run'; return; }
   runId = data.run_id;
