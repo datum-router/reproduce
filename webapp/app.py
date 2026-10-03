@@ -21,9 +21,11 @@ import datetime
 import html
 import json
 import os
+import queue
 import re
 import sys
 import threading
+import time
 import traceback
 import uuid
 
@@ -91,10 +93,13 @@ class WebAgent(Agent):
     - every log line / step / completion is pushed through callbacks.
     """
 
-    def __init__(self, run_id, url, profile, rules, max_steps, callbacks):
+    def __init__(self, run_id, url, profile, rules, max_steps, callbacks,
+                 control_queue, paused):
         super().__init__(url, profile, rules, headed=False,
                          auto_submit=False, max_steps=max_steps)
         self.run_id = run_id
+        self.control_queue = control_queue  # user ops, agent thread executes
+        self.paused = paused                # threading.Event: human has control
         self.run_dir = os.path.join(RUNS_DIR, run_id)
         self.shots_dir = os.path.join(self.run_dir, "shots")
         os.makedirs(self.shots_dir, exist_ok=True)
@@ -121,11 +126,60 @@ class WebAgent(Agent):
                                    fname)
         except Exception as exc:  # noqa: BLE001
             self.log("screenshot_failed", error=str(exc)[:200])
+        self.refresh_live()
+
+    def refresh_live(self):
+        """Overwrite runs/<run_id>/live.png with the current viewport."""
+        path = os.path.join(self.run_dir, "live.png")
+        try:
+            if self.page is not None:
+                self.page.screenshot(path=path)
+        except Exception as exc:  # noqa: BLE001
+            self.log("live_failed", error=str(exc)[:200])
+
+    def _apply_control_op(self, op):
+        """Execute one user control op. Called in the agent thread only,
+        because Playwright's sync API is not thread-safe."""
+        kind = op.get("op")
+        try:
+            if kind == "click":
+                self.page.mouse.click(float(op["x"]), float(op["y"]))
+            elif kind == "type":
+                self.page.keyboard.type(op.get("text", ""))
+            elif kind == "press":
+                self.page.keyboard.press(op.get("key", "Enter"))
+            elif kind == "scroll":
+                self.page.mouse.wheel(float(op.get("dx", 0)),
+                                      float(op.get("dy", 0)))
+            else:
+                self.log("control_rejected", op=str(kind)[:40])
+                return
+        except Exception as exc:  # noqa: BLE001
+            self.log("control_failed", op=str(kind)[:40],
+                     error=str(exc)[:200])
+            return
+        self.log("control", op=kind)
+        self.refresh_live()
+
+    def _drain_control_queue(self):
+        while True:
+            try:
+                op = self.control_queue.get_nowait()
+            except queue.Empty:
+                return
+            self._apply_control_op(op)
 
     # -- loop with web-mode guards --
 
     def fill_loop(self):
         while self.steps_executed < self.max_steps:
+            if self.paused.is_set():
+                # Human has the wheel: run their queued control ops, keep
+                # the live view fresh, and do NOT call the LLM while paused.
+                self._drain_control_queue()
+                self.refresh_live()
+                time.sleep(0.3)
+                continue
             items, by_id = self.snapshot()
             self.callbacks.on_log("snapshot: %d elements on %s"
                                   % (len(items), self.page.url))
@@ -186,6 +240,7 @@ class WebAgent(Agent):
         how = "error"
         try:
             self.start()
+            self.refresh_live()  # so the live panel shows something at once
             try:
                 how = self.fill_loop()
                 self.log("finished", how=how)
@@ -203,10 +258,12 @@ class WebAgent(Agent):
         self.callbacks.on_done(how, summary)
 
 
-def run_application(run_id, url, profile, rules, max_steps, callbacks):
+def run_application(run_id, url, profile, rules, max_steps, callbacks,
+                    control_queue, paused):
     """Entry point used by the web UI: build a WebAgent and run it."""
     agent = WebAgent(run_id, url, profile, rules,
-                     max_steps=max_steps, callbacks=callbacks)
+                     max_steps=max_steps, callbacks=callbacks,
+                     control_queue=control_queue, paused=paused)
     agent.run()
     return run_id
 
@@ -248,10 +305,11 @@ def make_callbacks(run_id):
     return Callbacks(on_log, on_step, on_done)
 
 
-def _run_in_thread(run_id, url, profile, rules_text, max_steps):
+def _run_in_thread(run_id, url, profile, rules_text, max_steps,
+                   control_queue, paused):
     try:
         run_application(run_id, url, profile, rules_text, max_steps,
-                        make_callbacks(run_id))
+                        make_callbacks(run_id), control_queue, paused)
     except Exception as exc:  # noqa: BLE001 - never leave a run hanging
         rec = _record(run_id)
         if rec is not None:
@@ -292,10 +350,13 @@ def api_start_run():
     max_steps = max(1, min(100, max_steps))
 
     run_id = uuid.uuid4().hex[:12]
+    control_queue = queue.Queue()
+    paused = threading.Event()
     with runs_lock:
         runs[run_id] = {
             "run_id": run_id,
             "state": "starting",
+            "paused": False,
             "url": url,
             "max_steps": max_steps,
             "steps_done": 0,
@@ -303,9 +364,12 @@ def api_start_run():
             "shots": [],
             "summary": None,
             "started": datetime.datetime.now().isoformat(timespec="seconds"),
+            "control_queue": control_queue,
+            "paused_event": paused,
         }
     t = threading.Thread(target=_run_in_thread,
-                         args=(run_id, url, profile, RULES_TEXT, max_steps),
+                         args=(run_id, url, profile, RULES_TEXT, max_steps,
+                               control_queue, paused),
                          daemon=True)
     with runs_lock:
         runs[run_id]["state"] = "running"
@@ -322,12 +386,99 @@ def api_run_status(run_id):
         return jsonify({
             "run_id": rec["run_id"],
             "state": rec["state"],
+            "paused": rec.get("paused", False),
             "url": rec["url"],
             "steps_done": rec["steps_done"],
             "log_tail": rec["log"][-80:],
             "shots": rec["shots"],
             "summary": rec["summary"],
         })
+
+
+def _is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+@app.route("/api/runs/<run_id>/pause", methods=["POST"])
+def api_pause(run_id):
+    rec = _record(run_id)
+    if rec is None:
+        return jsonify({"error": "unknown run_id"}), 404
+    with runs_lock:
+        if rec["state"] != "running":
+            return jsonify({"error": "run is not active"}), 409
+        rec["paused_event"].set()
+        rec["paused"] = True
+    return jsonify({"paused": True})
+
+
+@app.route("/api/runs/<run_id>/resume", methods=["POST"])
+def api_resume(run_id):
+    rec = _record(run_id)
+    if rec is None:
+        return jsonify({"error": "unknown run_id"}), 404
+    with runs_lock:
+        if rec["state"] != "running":
+            return jsonify({"error": "run is not active"}), 409
+        rec["paused_event"].clear()
+        rec["paused"] = False
+    return jsonify({"paused": False})
+
+
+@app.route("/api/runs/<run_id>/control", methods=["POST"])
+def api_control(run_id):
+    """Queue one user control op for the agent thread to execute.
+
+    Ops: click {x,y}, type {text}, press {key}, scroll {dx,dy}.
+    Coordinates are CSS pixels in the page viewport.
+    """
+    rec = _record(run_id)
+    if rec is None:
+        return jsonify({"error": "unknown run_id"}), 404
+    data = request.get_json(force=True, silent=True) or {}
+    op = data.get("op")
+    if op == "click":
+        x, y = data.get("x"), data.get("y")
+        if not _is_num(x) or not _is_num(y):
+            return jsonify({"error": "click needs numeric x and y"}), 400
+        action = {"op": "click", "x": float(x), "y": float(y)}
+    elif op == "type":
+        text = data.get("text", "")
+        if not isinstance(text, str) or not text:
+            return jsonify({"error": "type needs a non-empty text"}), 400
+        action = {"op": "type", "text": text[:2000]}
+    elif op == "press":
+        key = data.get("key", "")
+        if not isinstance(key, str) or not key:
+            return jsonify({"error": "press needs a key"}), 400
+        action = {"op": "press", "key": key[:40]}
+    elif op == "scroll":
+        dx, dy = data.get("dx", 0), data.get("dy", 0)
+        if not _is_num(dx) or not _is_num(dy):
+            return jsonify({"error": "scroll needs numeric dx/dy"}), 400
+        action = {"op": "scroll", "dx": float(dx), "dy": float(dy)}
+    else:
+        return jsonify({"error": "unknown op (click/type/press/scroll)"}), 400
+    with runs_lock:
+        if rec["state"] != "running":
+            return jsonify({"error": "run is not active"}), 409
+        # A control op means the human wants the wheel: pause the agent so
+        # the op is picked up on the next loop pass, even if they skipped
+        # the Take control button.
+        rec["paused_event"].set()
+        rec["paused"] = True
+        rec["control_queue"].put(action)
+    return jsonify({"queued": op, "paused": True})
+
+
+@app.route("/runs/<run_id>/live.png")
+def serve_live(run_id):
+    if not RUN_ID_RE.match(run_id):
+        return jsonify({"error": "not found"}), 404
+    directory = os.path.join(RUNS_DIR, run_id)
+    if not os.path.exists(os.path.join(directory, "live.png")):
+        return jsonify({"error": "no live image yet"}), 404
+    return send_from_directory(directory, "live.png")
 
 
 @app.route("/runs/<run_id>/shots/<fname>")
@@ -365,6 +516,14 @@ INDEX_HTML = """<!doctype html>
   #summary { white-space: pre-wrap; font-family: monospace; font-size: 13px;
              background: #f0f4ff; padding: 12px; border-radius: 6px; }
   .note { color: #555; font-size: 13px; }
+  #liveWrap { text-align: center; }
+  #live { max-width: 100%; border: 1px solid #ccc; border-radius: 4px; }
+  #controlBanner { display: none; background: #fff3cd; border: 1px solid #e0c36a;
+                   padding: 10px; border-radius: 6px; margin-bottom: 10px;
+                   font-weight: 600; }
+  #controlBar { display: none; margin-top: 10px; }
+  #controlBar button { margin: 2px; padding: 6px 10px; font-size: 13px; }
+  #controlBar input[type=text] { width: 260px; display: inline-block; }
 </style>
 </head>
 <body>
@@ -384,6 +543,31 @@ before the final Submit button. Watch the log and screenshots below.</p>
 </div>
 
 <div class="card">
+  <h3>Live browser</h3>
+  <div id="controlBanner">PAUSED: you have control of the browser. Click the page
+  below, or use the toolbar, then hit "Resume agent" to hand it back.</div>
+  <div id="liveWrap"><img id="live" alt="live browser view" style="display:none"></div>
+  <p>
+    <button id="takeControl" onclick="takeControl()" disabled>Take control</button>
+    <button id="resumeAgent" onclick="resumeAgent()" style="display:none">Resume agent</button>
+  </p>
+  <div id="controlBar">
+    <input type="text" id="typeText" placeholder="text to type into the focused field">
+    <button onclick="sendType()">Type</button>
+    <button onclick="sendKey('Tab')">Tab</button>
+    <button onclick="sendKey('Enter')">Enter</button>
+    <button onclick="sendKey('Escape')">Esc</button>
+    <button onclick="sendKey('ArrowDown')">Down</button>
+    <button onclick="sendKey('ArrowUp')">Up</button>
+    <button onclick="sendScroll(-400)">Scroll up</button>
+    <button onclick="sendScroll(400)">Scroll down</button>
+  </div>
+  <p class="note">While you have control, clicking the live image clicks that spot
+  in the real browser. The agent never submits on its own; clicks you make yourself
+  are your own action.</p>
+</div>
+
+<div class="card">
   <h3>Live log</h3>
   <div id="log">(no run yet)</div>
 </div>
@@ -400,6 +584,56 @@ before the final Submit button. Watch the log and screenshots below.</p>
 
 <script>
 let runId = null, timer = null, logSeen = 0, shotsSeen = 0;
+let controlling = false;
+
+async function takeControl() {
+  if (!runId) return;
+  const r = await fetch('/api/runs/' + runId + '/pause', {method: 'POST'});
+  if (r.ok) { controlling = true; updateControlUI(); }
+}
+
+async function resumeAgent() {
+  if (!runId) return;
+  const r = await fetch('/api/runs/' + runId + '/resume', {method: 'POST'});
+  if (r.ok) { controlling = false; updateControlUI(); }
+}
+
+function updateControlUI() {
+  document.getElementById('takeControl').style.display = controlling ? 'none' : '';
+  document.getElementById('resumeAgent').style.display = controlling ? '' : 'none';
+  document.getElementById('controlBanner').style.display = controlling ? '' : 'none';
+  document.getElementById('controlBar').style.display = controlling ? '' : 'none';
+  document.getElementById('live').style.cursor = controlling ? 'crosshair' : 'default';
+}
+
+async function sendControl(payload) {
+  if (!runId) return;
+  await fetch('/api/runs/' + runId + '/control', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)});
+}
+
+function sendType() {
+  const t = document.getElementById('typeText').value;
+  if (t) sendControl({op: 'type', text: t});
+}
+function sendKey(key) { sendControl({op: 'press', key: key}); }
+function sendScroll(dy) { sendControl({op: 'scroll', dx: 0, dy: dy}); }
+
+document.getElementById('live').addEventListener('click', (e) => {
+  if (!controlling || !runId) return;
+  const img = e.currentTarget;
+  if (!img.naturalWidth || !img.clientWidth) return;
+  const x = e.offsetX * (img.naturalWidth / img.clientWidth);
+  const y = e.offsetY * (img.naturalHeight / img.clientHeight);
+  sendControl({op: 'click', x: x, y: y});
+});
+document.getElementById('live').addEventListener('error', function() {
+  this.style.display = 'none';
+});
+document.getElementById('live').addEventListener('load', function() {
+  this.style.display = '';
+});
 
 async function startRun() {
   const url = document.getElementById('url').value.trim();
@@ -420,6 +654,8 @@ async function startRun() {
   const data = await r.json();
   if (!r.ok) { alert(data.error || 'Failed to start'); btn.disabled = false; btn.textContent = 'Start run'; return; }
   runId = data.run_id;
+  controlling = false; updateControlUI();
+  document.getElementById('takeControl').disabled = true;
   timer = setInterval(poll, 1500);
   poll();
 }
@@ -428,6 +664,15 @@ async function poll() {
   if (!runId) return;
   const r = await fetch('/api/runs/' + runId + '/status');
   const s = await r.json();
+  const live = document.getElementById('live');
+  if (s.state === 'running' || s.state === 'starting') {
+    live.src = '/runs/' + runId + '/live.png?t=' + Date.now();
+    document.getElementById('takeControl').disabled = false;
+  }
+  if (typeof s.paused === 'boolean' && s.paused !== controlling) {
+    controlling = s.paused;
+    updateControlUI();
+  }
   const logEl = document.getElementById('log');
   const lines = s.log_tail || [];
   for (let i = logSeen; i < lines.length; i++) logEl.textContent += lines[i] + '\\n';
@@ -447,6 +692,8 @@ async function poll() {
       (s.summary && s.summary.text) || ('state: ' + s.state);
     const btn = document.getElementById('start');
     btn.disabled = false; btn.textContent = 'Start run';
+    document.getElementById('takeControl').disabled = true;
+    controlling = false; updateControlUI();
   }
 }
 </script>

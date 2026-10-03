@@ -14,7 +14,7 @@ the container to build (it installs Python deps and Chromium, then starts
 the web app automatically). Open the forwarded port **5000** ("Job Agent
 Web UI") when it pops up, or find it under the Ports tab. Paste a job
 posting URL, check the prefilled John Doe test profile, hit Start, and
-watch the live log and screenshots.
+watch the live browser view, live log, and screenshots.
 
 **Option B: Actions (headless run, no UI).**
 Repo page > Actions > "Run job-apply agent" > Run workflow. Enter the job
@@ -61,6 +61,11 @@ these optional environment variables (overrides only):
 | `LLM_MODEL`    | `openai`                             | Model name for the endpoint        |
 | `LLM_API_KEY`  | _(empty)_                             | Needed for most providers; Pollinations needs none |
 
+Transient upstream hiccups (HTTP 5xx, connection errors) are retried
+automatically: up to 3 attempts with 2s / 5s / 12s backoff, so one bad
+Pollinations response doesn't kill a run. 4xx errors fail fast with no
+retry.
+
 ## Profile setup
 
 `profile.json` holds your personal data and is **gitignored**, so it never
@@ -95,6 +100,24 @@ python run.py --url https://example.com/jobs/123 --headed --auto-submit
 # Bigger step budget for long multi-page forms.
 python run.py --url https://example.com/jobs/123 --max-steps 80
 ```
+
+## Live browser view + take control (web UI)
+
+While a run is active, the web UI shows a **Live browser** panel: a fresh
+screenshot of the sandboxed Chromium about every second, so you can watch
+the agent fill the form in real time.
+
+- **Take control** pauses the agent mid-run (safe at any point; no LLM call
+  happens while paused) and gives you the wheel. A banner marks control mode.
+- Click directly on the live image to click that spot in the real browser
+  (coordinates are scaled to the page automatically). The toolbar lets you
+  type text, press keys (Tab, Enter, Esc, arrows), and scroll.
+- **Resume agent** hands control back; the agent re-snapshots the page and
+  carries on from whatever state you left it in.
+
+Safety is unchanged: web runs never auto-submit, and the agent's own
+submit-button block stays in place. Clicks you make yourself in control
+mode are your own action.
 
 ## How it works: observe / decide / act
 
