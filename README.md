@@ -27,7 +27,9 @@ artifact: it holds `runs/<id>/log.jsonl` and every step screenshot.
 python webapp/app.py   # http://localhost:5000 (PORT env to change)
 ```
 
-All three use the John Doe test profile. The web UI and the Actions run
+All three use the John Doe test profile. No API keys or secrets are
+needed anywhere: Codespaces, the web UI, and the Actions workflow all use
+the anonymous Pollinations default out of the box. The web UI and the Actions run
 never submit: the agent always stops before the final Submit/Apply button
 and returns a filled-fields summary.
 
@@ -44,7 +46,14 @@ is enough for headless runs.
 
 ## Configuration
 
-Environment variables (all optional):
+### LLM: no key needed
+
+The agent uses **Pollinations.ai (anonymous) by default** — no API key, no
+signup, no secrets to configure. The web UI, Codespaces, and the Actions
+workflow all work out of the box with zero LLM setup.
+
+To point the agent at a different OpenAI-compatible model instead, set
+these optional environment variables (overrides only):
 
 | Var            | Default                              | Notes                              |
 |----------------|--------------------------------------|------------------------------------|
